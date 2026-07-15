@@ -33,19 +33,39 @@ const teamCodeOverrides: Record<string, string> = {
 };
 
 export function deriveTeamCode(name: string) {
-  const override = teamCodeOverrides[name];
+  if (!name || name.trim() === "") return "CLB";
+  const cleanName = name.trim();
+  const override = teamCodeOverrides[cleanName];
   if (override) return override;
 
-  const letters = name
+  const words = cleanName
     .split(/[\s-]+/)
     .map((part) => part.replace(/[^A-Za-z]/g, ""))
     .filter(Boolean);
 
-  if (letters.length >= 2) {
-    return `${letters[0][0] ?? ""}${letters[1][0] ?? ""}${letters[1][1] ?? ""}`.toUpperCase();
+  if (words.length === 0) return "CLB";
+
+  // Filter out generic club suffixes/prefixes when generating 3-letter code if possible
+  const meaningfulWords = words.filter(
+    (w) => !["FC", "CF", "SC", "AC", "FK", "BK", "SV", "AFC"].includes(w.toUpperCase()),
+  );
+  const targetWords = meaningfulWords.length > 0 ? meaningfulWords : words;
+
+  if (targetWords.length >= 3) {
+    return `${targetWords[0][0]}${targetWords[1][0]}${targetWords[2][0]}`.toUpperCase();
   }
 
-  return name.replace(/[^A-Za-z]/g, "").slice(0, 3).toUpperCase() || "CLB";
+  if (targetWords.length === 2) {
+    const first = targetWords[0];
+    const second = targetWords[1];
+    if (first.length >= 2) {
+      return `${first[0]}${first[1]}${second[0]}`.toUpperCase();
+    }
+    return `${first[0]}${second[0]}${second[1] ?? ""}`.toUpperCase();
+  }
+
+  const singleWord = targetWords[0];
+  return singleWord.slice(0, 3).toUpperCase() || "CLB";
 }
 
 function parseMinuteNumber(minute: string) {
@@ -103,7 +123,7 @@ export function formatMinuteLabel(
   return cleanMinute.includes("'") ? cleanMinute : `${cleanMinute}'`;
 }
 
-function buildFixtureMeta(status: MatchStatus, kickoffUtc: string, phase: string | null | undefined) {
+function buildFixtureMeta(status: MatchStatus, kickoffUtc: string) {
   if (status === "upcoming") {
     return {
       competition: `Kickoff ${formatUtcKickoff(kickoffUtc)}`,
@@ -128,7 +148,7 @@ export function createFixtureFromDto(dto: BackendFixtureDto | BackendMatchDto) {
   const status = toMatchStatus(dto.phase, dto.kickOff);
   const teamACode = deriveTeamCode(dto.homeName);
   const teamBCode = deriveTeamCode(dto.awayName);
-  const meta = buildFixtureMeta(status, dto.kickOff, dto.phase);
+  const meta = buildFixtureMeta(status, dto.kickOff);
 
   return {
     fixtureId: dto.fixtureId,
@@ -214,16 +234,31 @@ function isUsableHistoryTimestamp(timestamp: string) {
 }
 
 function normalizeProbabilityHistory(history: ProbabilityPoint[]) {
-  const dedupedByTimestamp = new Map<string, ProbabilityPoint>();
+  const seenTimestamps = new Map<string, number>();
+  let previousTime = 0;
 
-  history.forEach((point) => {
-    if (!isUsableHistoryTimestamp(point.timestamp)) return;
-    dedupedByTimestamp.set(point.timestamp, point);
+  return history.map((point, index) => {
+    const timestampCount = seenTimestamps.get(point.timestamp) ?? 0;
+    seenTimestamps.set(point.timestamp, timestampCount + 1);
+    const parsedTime = new Date(point.timestamp).getTime();
+
+    if (
+      timestampCount === 0 &&
+      isUsableHistoryTimestamp(point.timestamp) &&
+      parsedTime > previousTime
+    ) {
+      previousTime = parsedTime;
+      return point;
+    }
+
+    const nextTime = previousTime > 0 ? previousTime + 1000 : Date.now() + index * 1000;
+    previousTime = nextTime;
+
+    return {
+      ...point,
+      timestamp: new Date(nextTime).toISOString(),
+    };
   });
-
-  return [...dedupedByTimestamp.values()].sort(
-    (left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime(),
-  );
 }
 
 export function historyToProbabilityPoints(
@@ -231,7 +266,7 @@ export function historyToProbabilityPoints(
   fixture: Fixture,
   fallbackProbabilities: LiveMatchState["currentProbabilities"],
 ) {
-  const oddsHistory = history?.oddsHistory?.filter((point) => isUsableHistoryTimestamp(point.timestamp)) ?? [];
+  const oddsHistory = history?.oddsHistory ?? [];
 
   if (oddsHistory.length === 0) {
     return seedHistoryFromCurrentState(
@@ -242,13 +277,16 @@ export function historyToProbabilityPoints(
   }
 
   return normalizeProbabilityHistory(
-    oddsHistory.map((point) => {
-      const elapsedMinutes = Math.max(
-        0,
-        Math.round(
-          (new Date(point.timestamp).getTime() - new Date(fixture.kickoffUtc).getTime()) / 60_000,
-        ),
-      );
+    oddsHistory.map((point, index) => {
+      const hasUsableTimestamp = isUsableHistoryTimestamp(point.timestamp);
+      const elapsedMinutes = hasUsableTimestamp
+        ? Math.max(
+            0,
+            Math.round(
+              (new Date(point.timestamp).getTime() - new Date(fixture.kickoffUtc).getTime()) / 60_000,
+            ),
+          )
+        : index;
 
       return {
         timestamp: point.timestamp,
@@ -259,6 +297,95 @@ export function historyToProbabilityPoints(
       } satisfies ProbabilityPoint;
     }),
   );
+}
+
+function normalizeEventType(eventType: string): MatchEvent["type"] {
+  const value = eventType.replace(/([a-z])([A-Z])/g, "$1_$2").replace(/[-\s]+/g, "_").toLowerCase();
+
+  if (value.includes("goal")) return "goal";
+  if (value.includes("yellow") && value.includes("card")) return "yellow-card";
+  if (value.includes("red") && value.includes("card")) return "red-card";
+  if (value.includes("penalty")) {
+    if (value.includes("miss")) return "penalty-missed";
+    if (value.includes("scor")) return "penalty-scored";
+    return "penalty-awarded";
+  }
+  if (value.includes("var")) return "var";
+  if (value.includes("half")) return "half-time";
+  if (value.includes("full") || value.includes("final")) return "full-time";
+
+  return "status";
+}
+
+function eventImportance(type: MatchEvent["type"]): MatchEvent["importance"] {
+  if (type === "goal" || type === "red-card" || type.startsWith("penalty")) return "high";
+  if (type === "yellow-card" || type === "var") return "medium";
+  if (type === "half-time" || type === "full-time") return "structural";
+  return "low";
+}
+
+function scoreEventSide(
+  event: NonNullable<BackendMatchHistoryDto["events"]>[number],
+  previousEvent: NonNullable<BackendMatchHistoryDto["events"]>[number] | undefined,
+): MatchEvent["side"] {
+  const previousHomeScore = previousEvent?.homeScore ?? 0;
+  const previousAwayScore = previousEvent?.awayScore ?? 0;
+  const homeDelta = event.homeScore - previousHomeScore;
+  const awayDelta = event.awayScore - previousAwayScore;
+
+  if (homeDelta > awayDelta) return "teamA";
+  if (awayDelta > homeDelta) return "teamB";
+  return "draw";
+}
+
+function eventTitle(eventType: string) {
+  return eventType
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/[-_]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+export function historyToMatchEvents(history: BackendMatchHistoryDto | null, fixture: Fixture) {
+  const events = history?.events ?? [];
+
+  return events.map((event, index) => {
+    const type = normalizeEventType(event.eventType);
+    const side = scoreEventSide(event, events[index - 1]);
+    const teamCode =
+      side === "teamA" ? fixture.teamACode : side === "teamB" ? fixture.teamBCode : undefined;
+    const minuteLabel = formatMinuteLabel(
+      fixture.status,
+      event.minute ?? undefined,
+      fixture.kickoffUtc,
+    );
+
+    return {
+      eventId: `${fixture.fixtureId}-be1-${event.eventType}-${event.timestamp}-${index}`,
+      fixtureId: fixture.fixtureId,
+      type,
+      minuteLabel,
+      timestamp: event.timestamp,
+      side,
+      teamCode,
+      label: type === "goal" ? `${teamCode ?? "MKT"} goal` : eventTitle(event.eventType),
+      detailLabel: `${event.phase ?? fixture.phase} / ${event.homeScore} - ${event.awayScore}`,
+      importance: eventImportance(type),
+    } satisfies MatchEvent;
+  });
+}
+
+export function mergeMatchEvents(...eventGroups: MatchEvent[][]) {
+  const byId = new Map<string, MatchEvent>();
+
+  eventGroups.flat().forEach((event) => {
+    byId.set(event.eventId, event);
+  });
+
+  return [...byId.values()].sort((left, right) => {
+    const timeDelta = new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime();
+    if (!Number.isNaN(timeDelta) && timeDelta !== 0) return timeDelta;
+    return left.eventId.localeCompare(right.eventId);
+  });
 }
 
 export function createSystemEvent(
