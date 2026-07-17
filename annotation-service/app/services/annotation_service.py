@@ -7,11 +7,20 @@ from app.services.history_service import HistoryService
 from app.services.commentary_service import CommentaryService
 from app.services.lineup_store import LineupStore
 
+import time
+from collections import deque
+
 logger = logging.getLogger(__name__)
 
 DISPLAY_TITLES = {
     "halftime_finalised": "Half-Time",
     "game_finalised": "Match End",
+}
+
+STATUS_TITLES = {
+    6: "Extra Time",
+    8: "Half-Time (ET)",
+    11: "Penalties",
 }
 
 
@@ -24,6 +33,7 @@ class AnnotationService:
         self.history = HistoryService()
         self._emitted: set[tuple] = set()
         self.lineup_store = LineupStore()  # (FixtureId, Action, Id) already emitted
+        self._latencies: deque[float] = deque(maxlen=50)
 
     async def restore_lineups(self, fixture_id: int) -> None:
         data = await self.lineup_store.load(fixture_id)
@@ -50,6 +60,10 @@ class AnnotationService:
             await self.history.discard(event)
             return
 
+        if action == "status":
+            await self._handle_period_transition(event)
+            return
+
         # Step 1: Ignore events we don't care about
         if not self.rule_engine.should_process(event):
             return
@@ -67,6 +81,31 @@ class AnnotationService:
 
         self._emitted.add(key)
         await self._emit(entity, is_update=False)
+
+    async def _handle_period_transition(self, event: dict):
+        """The feed's generic 'status' action fires on every phase change. Most
+        of those we already never touch. These 3 StatusIds are the only ones with
+        no other signal (extra time start, HT of ET, going to penalties)."""
+        if event.get("StatusId") not in STATUS_TITLES:
+            return
+
+        key = (event.get("FixtureId"), "status", event.get("Id"))
+        if key in self._emitted:
+            return
+        self._emitted.add(key)
+
+        entity = self.entity_resolver.resolve(event)["entity"]
+        annotation = self.commentary.generate_period_transition(entity)
+        if annotation is None:
+            return
+
+        annotation["fixture_id"] = entity.get("FixtureId")
+        annotation["source_action"] = STATUS_TITLES[event.get("StatusId")]
+        annotation["source_id"] = entity.get("Id")
+        clock = entity.get("Clock") or {}
+        annotation["source_seconds"] = clock.get("Seconds")
+        annotation["outcome"] = None
+        await self.history.save(annotation)
 
     # ------------------------------------------------------------------
     async def _handle_amend(self, event: dict):
@@ -100,6 +139,8 @@ class AnnotationService:
         else:
             annotation = self.commentary.generate(entity)
 
+        self._record_latency(entity)
+
         annotation["fixture_id"] = entity.get("FixtureId")
         action = entity.get("Action")
         annotation["source_action"] = DISPLAY_TITLES.get(action, action)
@@ -112,3 +153,17 @@ class AnnotationService:
             await self.history.update(annotation)
         else:
             await self.history.save(annotation)
+
+    # ----------------------------------------------------
+    def _record_latency(self, entity: dict):
+        ts = entity.get("Ts")
+        if ts is None:
+            return
+        latency_ms = (time.time() * 1000) - ts
+        if latency_ms >= 0:  # guard against clock skew producing a negative
+            self._latencies.append(latency_ms)
+
+    def average_latency_ms(self) -> float | None:
+        if not self._latencies:
+            return None
+        return round(sum(self._latencies) / len(self._latencies), 1)
